@@ -88,6 +88,10 @@ class OptimizationParams(ParamGroup):
         self.exposure_lr_delay_mult = 0.0
         self.percent_dense = 0.01
         self.lambda_dssim = 0.2
+        self.lambda_alpha = 0.0
+        self.boundary_alpha_weight = 1.0
+        self.alpha_bg_threshold = 0.05
+        self.alpha_fg_threshold = 0.95
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500
