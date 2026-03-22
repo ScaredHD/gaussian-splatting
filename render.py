@@ -14,6 +14,9 @@ from os import makedirs
 
 import torch
 import torchvision
+
+
+EPS = 1e-8
 from tqdm import tqdm
 
 from arguments import ModelParams, PipelineParams, get_combined_args
@@ -46,6 +49,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     alpha_pred_path = os.path.join(model_path, name, "ours_{}".format(iteration), "alpha_pred")
     alpha_gt_path = os.path.join(model_path, name, "ours_{}".format(iteration), "alpha_gt")
     gt_premul_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt_premul")
+    render_straight_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders_straight")
 
     makedirs(render_path, exist_ok=True)
     makedirs(gts_path, exist_ok=True)
@@ -53,6 +57,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         makedirs(alpha_pred_path, exist_ok=True)
         makedirs(alpha_gt_path, exist_ok=True)
         makedirs(gt_premul_path, exist_ok=True)
+        makedirs(render_straight_path, exist_ok=True)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         render_pkg = render(view, gaussians, pipeline, background, use_trained_exp=train_test_exp, separate_sh=separate_sh)
@@ -71,9 +76,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torchvision.utils.save_image(rendering, os.path.join(render_path, filename))
         torchvision.utils.save_image(gt_rgb, os.path.join(gts_path, filename))
         if save_alpha_outputs:
+            pred_rgb_straight = torch.where(pred_alpha > EPS, rendering / pred_alpha.clamp_min(EPS), torch.zeros_like(rendering)).clamp(0.0, 1.0)
             torchvision.utils.save_image(pred_alpha, os.path.join(alpha_pred_path, filename))
             torchvision.utils.save_image(gt_alpha, os.path.join(alpha_gt_path, filename))
             torchvision.utils.save_image(gt_premul, os.path.join(gt_premul_path, filename))
+            torchvision.utils.save_image(pred_rgb_straight, os.path.join(render_straight_path, filename))
 
 
 

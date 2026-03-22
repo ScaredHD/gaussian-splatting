@@ -8,6 +8,7 @@
 # For inquiries contact  george.drettakis@inria.fr
 #
 
+import json
 import os
 import sys
 import uuid
@@ -15,6 +16,7 @@ from argparse import ArgumentParser, Namespace
 from random import randint
 
 import torch
+import torch.nn.functional as F
 from tqdm import tqdm
 
 from arguments import ModelParams, OptimizationParams, PipelineParams
@@ -47,6 +49,23 @@ except Exception:
 
 
 EPS = 1e-8
+SUPPORT_DIAGNOSTIC_THRESHOLD = 0.10
+SUPPORT_PRUNE_MIN_HITS = 8
+SUPPORT_PRUNE_OPACITY_CAP = 0.02
+SUPPORT_BASE_RADIUS_PX = 2.0
+SUPPORT_INNER_OFFSETS_PX = (
+    (0.0, 0.0),
+    (0.5 * SUPPORT_BASE_RADIUS_PX, 0.0),
+    (-0.5 * SUPPORT_BASE_RADIUS_PX, 0.0),
+    (0.0, 0.5 * SUPPORT_BASE_RADIUS_PX),
+    (0.0, -0.5 * SUPPORT_BASE_RADIUS_PX),
+)
+SUPPORT_RING_OFFSETS_PX = (
+    (1.5 * SUPPORT_BASE_RADIUS_PX, 0.0),
+    (-1.5 * SUPPORT_BASE_RADIUS_PX, 0.0),
+    (0.0, 1.5 * SUPPORT_BASE_RADIUS_PX),
+    (0.0, -1.5 * SUPPORT_BASE_RADIUS_PX),
+)
 
 
 def get_ground_truth_tensors(viewpoint, alpha_bg_threshold=None, alpha_fg_threshold=None):
@@ -91,6 +110,130 @@ def compute_weighted_alpha_l1(pred_alpha, gt_alpha, boundary_mask, boundary_alph
     if boundary_mask is not None:
         weights = weights + boundary_alpha_weight * boundary_mask
     return (weights * torch.abs(pred_alpha - gt_alpha)).sum() / (weights.sum() + EPS)
+
+
+def flatten_visibility_filter(visibility_filter):
+    return visibility_filter.long().view(-1)
+
+
+def project_points_to_image_grid(points, full_proj_transform):
+    if points.shape[0] == 0:
+        empty_grid = torch.empty((0, 2), dtype=points.dtype, device=points.device)
+        empty_mask = torch.empty((0,), dtype=torch.bool, device=points.device)
+        return empty_grid, empty_mask
+
+    ones = torch.ones((points.shape[0], 1), dtype=points.dtype, device=points.device)
+    points_h = torch.cat((points, ones), dim=1)
+    clip_points = points_h @ full_proj_transform
+    w = clip_points[:, 3]
+    valid_w = torch.abs(w) > EPS
+
+    grid = torch.zeros((points.shape[0], 2), dtype=points.dtype, device=points.device)
+    if valid_w.any():
+        ndc = clip_points[valid_w, :2] / w[valid_w].unsqueeze(-1)
+        grid[valid_w, 0] = ndc[:, 0]
+        grid[valid_w, 1] = -ndc[:, 1]
+
+    inside_mask = valid_w & torch.isfinite(grid).all(dim=1)
+    inside_mask = inside_mask & (grid[:, 0] >= -1.0) & (grid[:, 0] <= 1.0) & (grid[:, 1] >= -1.0) & (grid[:, 1] <= 1.0)
+    return grid, inside_mask
+
+
+def sample_alpha_at_grid(gt_alpha, sample_grid):
+    if sample_grid.shape[0] == 0:
+        return torch.empty((0,), dtype=gt_alpha.dtype, device=gt_alpha.device)
+
+    grid = sample_grid.view(1, sample_grid.shape[0], 1, 2)
+    sampled = F.grid_sample(gt_alpha.unsqueeze(0), grid, mode="bilinear", padding_mode="zeros", align_corners=True)
+    return sampled.view(-1).clamp(0.0, 1.0)
+
+
+def sample_alpha_with_offsets(gt_alpha, base_grid, image_width, image_height, offsets_px):
+    if base_grid.shape[0] == 0:
+        return torch.empty((0, len(offsets_px)), dtype=gt_alpha.dtype, device=gt_alpha.device)
+
+    grid_offsets = []
+    for offset_x_px, offset_y_px in offsets_px:
+        offset_grid = base_grid.clone()
+        if image_width > 1:
+            offset_grid[:, 0] += (2.0 * offset_x_px) / float(image_width - 1)
+        if image_height > 1:
+            offset_grid[:, 1] += (2.0 * offset_y_px) / float(image_height - 1)
+        grid_offsets.append(offset_grid)
+
+    stacked_grid = torch.stack(grid_offsets, dim=1).reshape(-1, 2)
+    sampled = sample_alpha_at_grid(gt_alpha, stacked_grid)
+    return sampled.view(base_grid.shape[0], len(offsets_px))
+
+
+def compute_visible_support_observations(viewpoint, gaussians, gt_alpha, visibility_filter):
+    visible_indices = flatten_visibility_filter(visibility_filter)
+    if visible_indices.numel() == 0:
+        empty_indices = torch.empty((0,), dtype=torch.long, device=gt_alpha.device)
+        empty_values = torch.empty((0,), dtype=gt_alpha.dtype, device=gt_alpha.device)
+        return empty_indices, empty_values, empty_values
+
+    visible_points = gaussians.get_xyz[visible_indices]
+    sample_grid, update_mask = project_points_to_image_grid(visible_points, viewpoint.full_proj_transform)
+    if not update_mask.any():
+        empty_indices = torch.empty((0,), dtype=torch.long, device=gt_alpha.device)
+        empty_values = torch.empty((0,), dtype=gt_alpha.dtype, device=gt_alpha.device)
+        return empty_indices, empty_values, empty_values
+
+    updated_indices = visible_indices[update_mask]
+    updated_grid = sample_grid[update_mask]
+    a_in = sample_alpha_with_offsets(
+        gt_alpha,
+        updated_grid,
+        viewpoint.image_width,
+        viewpoint.image_height,
+        SUPPORT_INNER_OFFSETS_PX,
+    ).mean(dim=1)
+    a_ring = sample_alpha_with_offsets(
+        gt_alpha,
+        updated_grid,
+        viewpoint.image_width,
+        viewpoint.image_height,
+        SUPPORT_RING_OFFSETS_PX,
+    ).mean(dim=1)
+    grow_observations = a_in.clamp(0.0, 1.0)
+    prune_observations = (a_in * a_ring).clamp(0.0, 1.0)
+    return updated_indices, grow_observations, prune_observations
+
+
+def persist_support_stats(model_path, iteration, gaussians, snapshot_dir=None):
+    stats = {"iteration": int(iteration)}
+    stats.update(gaussians.compute_support_stats(SUPPORT_DIAGNOSTIC_THRESHOLD))
+
+    stats_path = os.path.join(model_path, "support_stats.json")
+    payload = {
+        "support_mode": "dual_support_v1",
+        "grow_observation": "a_in",
+        "prune_observation": "a_in_times_a_ring",
+        "diagnostic_threshold": SUPPORT_DIAGNOSTIC_THRESHOLD,
+        "latest": stats,
+        "snapshots": [stats],
+    }
+    if os.path.exists(stats_path):
+        with open(stats_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        snapshots = [snap for snap in payload.get("snapshots", []) if snap.get("iteration") != int(iteration)]
+        snapshots.append(stats)
+        snapshots.sort(key=lambda item: item.get("iteration", -1))
+        payload["snapshots"] = snapshots
+        payload["latest"] = stats
+        payload["support_mode"] = "dual_support_v1"
+        payload["grow_observation"] = "a_in"
+        payload["prune_observation"] = "a_in_times_a_ring"
+        payload["diagnostic_threshold"] = SUPPORT_DIAGNOSTIC_THRESHOLD
+
+    with open(stats_path, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+
+    if snapshot_dir is not None:
+        os.makedirs(snapshot_dir, exist_ok=True)
+        with open(os.path.join(snapshot_dir, "support_stats.json"), "w", encoding="utf-8") as f:
+            json.dump(stats, f, indent=2)
 
 
 
@@ -166,6 +309,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_start.record()
 
         gaussians.update_learning_rate(iteration)
+        gaussians.increment_age()
 
         if iteration % 1000 == 0:
             gaussians.oneupSHdegree()
@@ -214,10 +358,24 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_end.record()
 
         with torch.no_grad():
+            support_indices, grow_support_observations, prune_support_observations = compute_visible_support_observations(
+                viewpoint_cam,
+                gaussians,
+                gt_alpha,
+                visibility_filter,
+            )
+            gaussians.update_support(
+                support_indices,
+                grow_support_observations,
+                prune_support_observations,
+                opt.support_beta,
+            )
+
             ema_total_loss_for_log = 0.4 * loss.item() + 0.6 * ema_total_loss_for_log
             ema_rgb_loss_for_log = 0.4 * rgb_loss.item() + 0.6 * ema_rgb_loss_for_log
             ema_alpha_loss_for_log = 0.4 * alpha_loss.item() + 0.6 * ema_alpha_loss_for_log
             ema_depth_loss_for_log = 0.4 * ll1depth_value + 0.6 * ema_depth_loss_for_log
+            support_stats = gaussians.compute_support_stats(SUPPORT_DIAGNOSTIC_THRESHOLD)
 
             if iteration % 10 == 0:
                 progress_bar.set_postfix(
@@ -226,6 +384,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         "RGB": f"{ema_rgb_loss_for_log:.7f}",
                         "Alpha": f"{ema_alpha_loss_for_log:.7f}",
                         "Depth": f"{ema_depth_loss_for_log:.7f}",
+                        "Grow": f"{support_stats['grow_support_mean']:.4f}",
+                        "Prune": f"{support_stats['prune_support_mean']:.4f}",
                     }
                 )
                 progress_bar.update(10)
@@ -246,9 +406,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 dataset.train_test_exp,
                 opt,
             )
+            if iteration in testing_iterations or iteration == opt.iterations:
+                persist_support_stats(dataset.model_path, iteration, gaussians)
             if iteration in saving_iterations:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
+                persist_support_stats(
+                    dataset.model_path,
+                    iteration,
+                    gaussians,
+                    snapshot_dir=os.path.join(dataset.model_path, "point_cloud", "iteration_{}".format(iteration)),
+                )
 
             if iteration < opt.densify_until_iter:
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
@@ -256,7 +424,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
-                    gaussians.densify_and_prune(opt.densify_grad_threshold, 0.005, scene.cameras_extent, size_threshold, radii)
+                    gaussians.densify_and_prune(
+                        opt.densify_grad_threshold,
+                        0.005,
+                        scene.cameras_extent,
+                        size_threshold,
+                        radii,
+                        support_tau_densify=opt.support_tau_densify,
+                        support_tau_prune=opt.support_tau_prune,
+                        support_min_hits=SUPPORT_PRUNE_MIN_HITS,
+                        support_min_age=2 * opt.densification_interval,
+                        support_opacity_cap=SUPPORT_PRUNE_OPACITY_CAP,
+                    )
 
                 if iteration % opt.opacity_reset_interval == 0 or (dataset.white_background and iteration == opt.densify_from_iter):
                     gaussians.reset_opacity()
@@ -335,6 +514,19 @@ def training_report(tb_writer, iteration, rgb_loss, alpha_loss, total_loss, elap
 
     if tb_writer:
         tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
+        support_stats = scene.gaussians.compute_support_stats(SUPPORT_DIAGNOSTIC_THRESHOLD)
+        tb_writer.add_scalar("scene/grow_support_mean", support_stats["grow_support_mean"], iteration)
+        tb_writer.add_scalar("scene/grow_support_median", support_stats["grow_support_median"], iteration)
+        tb_writer.add_scalar("scene/prune_support_mean", support_stats["prune_support_mean"], iteration)
+        tb_writer.add_scalar("scene/prune_support_median", support_stats["prune_support_median"], iteration)
+        tb_writer.add_scalar("scene/ratio_prune_support_below_0_10", support_stats["ratio_prune_support_below_0_10"], iteration)
+        tb_writer.add_scalar("scene/support_hits_mean", support_stats["support_hits_mean"], iteration)
+        tb_writer.add_scalar("scene/support_pruned_count", support_stats["support_pruned_count"], iteration)
+        tb_writer.add_scalar(
+            "scene/densify_blocked_by_grow_support_count",
+            support_stats["densify_blocked_by_grow_support_count"],
+            iteration,
+        )
         tb_writer.add_scalar("total_points", scene.gaussians.get_xyz.shape[0], iteration)
     torch.cuda.empty_cache()
 

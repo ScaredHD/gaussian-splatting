@@ -60,9 +60,16 @@ class GaussianModel:
         self.max_radii2D = torch.empty(0)
         self.xyz_gradient_accum = torch.empty(0)
         self.denom = torch.empty(0)
+        self.support_grow_ema = torch.empty(0)
+        self.support_prune_ema = torch.empty(0)
+        self.support_hits = torch.empty(0, dtype=torch.int32)
+        self.age = torch.empty(0, dtype=torch.int32)
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self.tmp_radii = None
+        self.support_pruned_count = 0
+        self.densify_blocked_by_grow_support_count = 0
         self.setup_functions()
 
     def capture(self):
@@ -77,26 +84,74 @@ class GaussianModel:
             self.max_radii2D,
             self.xyz_gradient_accum,
             self.denom,
+            self.support_grow_ema,
+            self.support_prune_ema,
+            self.support_hits,
+            self.age,
             self.optimizer.state_dict(),
             self.spatial_lr_scale,
         )
     
     def restore(self, model_args, training_args):
-        (self.active_sh_degree, 
-        self._xyz, 
-        self._features_dc, 
-        self._features_rest,
-        self._scaling, 
-        self._rotation, 
-        self._opacity,
-        self.max_radii2D, 
-        xyz_gradient_accum, 
-        denom,
-        opt_dict, 
-        self.spatial_lr_scale) = model_args
+        if len(model_args) == 12:
+            (self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            opt_dict,
+            self.spatial_lr_scale) = model_args
+            support_grow_ema = torch.zeros((self._xyz.shape[0]), dtype=torch.float32, device="cuda")
+            support_prune_ema = torch.zeros((self._xyz.shape[0]), dtype=torch.float32, device="cuda")
+            support_hits = torch.zeros((self._xyz.shape[0]), dtype=torch.int32, device="cuda")
+            age = torch.zeros((self._xyz.shape[0]), dtype=torch.int32, device="cuda")
+        elif len(model_args) == 15:
+            (self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            support_ema,
+            support_hits,
+            age,
+            opt_dict,
+            self.spatial_lr_scale) = model_args
+            support_grow_ema = support_ema
+            support_prune_ema = support_ema.clone()
+        else:
+            (self.active_sh_degree,
+            self._xyz,
+            self._features_dc,
+            self._features_rest,
+            self._scaling,
+            self._rotation,
+            self._opacity,
+            self.max_radii2D,
+            xyz_gradient_accum,
+            denom,
+            support_grow_ema,
+            support_prune_ema,
+            support_hits,
+            age,
+            opt_dict,
+            self.spatial_lr_scale) = model_args
         self.training_setup(training_args)
         self.xyz_gradient_accum = xyz_gradient_accum
         self.denom = denom
+        self.support_grow_ema = support_grow_ema
+        self.support_prune_ema = support_prune_ema
+        self.support_hits = support_hits
+        self.age = age
         self.optimizer.load_state_dict(opt_dict)
 
     @property
@@ -170,6 +225,12 @@ class GaussianModel:
         self._rotation = nn.Parameter(rots.requires_grad_(True))
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
+        self.support_grow_ema = torch.zeros((self.get_xyz.shape[0]), dtype=torch.float32, device="cuda")
+        self.support_prune_ema = torch.zeros((self.get_xyz.shape[0]), dtype=torch.float32, device="cuda")
+        self.support_hits = torch.zeros((self.get_xyz.shape[0]), dtype=torch.int32, device="cuda")
+        self.age = torch.zeros((self.get_xyz.shape[0]), dtype=torch.int32, device="cuda")
+        self.support_pruned_count = 0
+        self.densify_blocked_by_grow_support_count = 0
         self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
         self.pretrained_exposures = None
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
@@ -179,6 +240,14 @@ class GaussianModel:
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
+        if self.support_grow_ema.shape[0] != self.get_xyz.shape[0]:
+            self.support_grow_ema = torch.zeros((self.get_xyz.shape[0]), dtype=torch.float32, device="cuda")
+        if self.support_prune_ema.shape[0] != self.get_xyz.shape[0]:
+            self.support_prune_ema = torch.zeros((self.get_xyz.shape[0]), dtype=torch.float32, device="cuda")
+        if self.support_hits.shape[0] != self.get_xyz.shape[0]:
+            self.support_hits = torch.zeros((self.get_xyz.shape[0]), dtype=torch.int32, device="cuda")
+        if self.age.shape[0] != self.get_xyz.shape[0]:
+            self.age = torch.zeros((self.get_xyz.shape[0]), dtype=torch.int32, device="cuda")
 
         l = [
             {'params': [self._xyz], 'lr': training_args.position_lr_init * self.spatial_lr_scale, "name": "xyz"},
@@ -310,8 +379,13 @@ class GaussianModel:
         self._opacity = nn.Parameter(torch.tensor(opacities, dtype=torch.float, device="cuda").requires_grad_(True))
         self._scaling = nn.Parameter(torch.tensor(scales, dtype=torch.float, device="cuda").requires_grad_(True))
         self._rotation = nn.Parameter(torch.tensor(rots, dtype=torch.float, device="cuda").requires_grad_(True))
-
         self.active_sh_degree = self.max_sh_degree
+        self.support_grow_ema = torch.zeros((self.get_xyz.shape[0]), dtype=torch.float32, device="cuda")
+        self.support_prune_ema = torch.zeros((self.get_xyz.shape[0]), dtype=torch.float32, device="cuda")
+        self.support_hits = torch.zeros((self.get_xyz.shape[0]), dtype=torch.int32, device="cuda")
+        self.age = torch.zeros((self.get_xyz.shape[0]), dtype=torch.int32, device="cuda")
+        self.support_pruned_count = 0
+        self.densify_blocked_by_grow_support_count = 0
 
     def replace_tensor_to_optimizer(self, tensor, name):
         optimizable_tensors = {}
@@ -361,7 +435,12 @@ class GaussianModel:
 
         self.denom = self.denom[valid_points_mask]
         self.max_radii2D = self.max_radii2D[valid_points_mask]
-        self.tmp_radii = self.tmp_radii[valid_points_mask]
+        self.support_grow_ema = self.support_grow_ema[valid_points_mask]
+        self.support_prune_ema = self.support_prune_ema[valid_points_mask]
+        self.support_hits = self.support_hits[valid_points_mask]
+        self.age = self.age[valid_points_mask]
+        if self.tmp_radii is not None:
+            self.tmp_radii = self.tmp_radii[valid_points_mask]
 
     def cat_tensors_to_optimizer(self, tensors_dict):
         optimizable_tensors = {}
@@ -385,7 +464,20 @@ class GaussianModel:
 
         return optimizable_tensors
 
-    def densification_postfix(self, new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii):
+    def densification_postfix(
+        self,
+        new_xyz,
+        new_features_dc,
+        new_features_rest,
+        new_opacities,
+        new_scaling,
+        new_rotation,
+        new_tmp_radii,
+        new_support_grow_ema,
+        new_support_prune_ema,
+        new_support_hits,
+        new_age,
+    ):
         d = {"xyz": new_xyz,
         "f_dc": new_features_dc,
         "f_rest": new_features_rest,
@@ -402,11 +494,15 @@ class GaussianModel:
         self._rotation = optimizable_tensors["rotation"]
 
         self.tmp_radii = torch.cat((self.tmp_radii, new_tmp_radii))
+        self.support_grow_ema = torch.cat((self.support_grow_ema, new_support_grow_ema))
+        self.support_prune_ema = torch.cat((self.support_prune_ema, new_support_prune_ema))
+        self.support_hits = torch.cat((self.support_hits, new_support_hits))
+        self.age = torch.cat((self.age, new_age))
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
 
-    def densify_and_split(self, grads, grad_threshold, scene_extent, N=2):
+    def densify_and_split(self, grads, grad_threshold, scene_extent, support_tau_densify=0.0, N=2):
         n_init_points = self.get_xyz.shape[0]
         # Extract points that satisfy the gradient condition
         padded_grad = torch.zeros((n_init_points), device="cuda")
@@ -414,6 +510,10 @@ class GaussianModel:
         selected_pts_mask = torch.where(padded_grad >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values > self.percent_dense*scene_extent)
+        if support_tau_densify > 0:
+            blocked_mask = torch.logical_and(selected_pts_mask, self.support_grow_ema < support_tau_densify)
+            self.densify_blocked_by_grow_support_count += int(blocked_mask.sum().item())
+            selected_pts_mask = torch.logical_and(selected_pts_mask, self.support_grow_ema >= support_tau_densify)
 
         stds = self.get_scaling[selected_pts_mask].repeat(N,1)
         means =torch.zeros((stds.size(0), 3),device="cuda")
@@ -426,17 +526,37 @@ class GaussianModel:
         new_features_rest = self._features_rest[selected_pts_mask].repeat(N,1,1)
         new_opacity = self._opacity[selected_pts_mask].repeat(N,1)
         new_tmp_radii = self.tmp_radii[selected_pts_mask].repeat(N)
+        new_support_grow_ema = self.support_grow_ema[selected_pts_mask].repeat(N)
+        new_support_prune_ema = self.support_prune_ema[selected_pts_mask].repeat(N)
+        new_support_hits = self.support_hits[selected_pts_mask].repeat(N)
+        new_age = torch.zeros((new_support_grow_ema.shape[0]), dtype=self.age.dtype, device="cuda")
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacity, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacity,
+            new_scaling,
+            new_rotation,
+            new_tmp_radii,
+            new_support_grow_ema,
+            new_support_prune_ema,
+            new_support_hits,
+            new_age,
+        )
 
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
-    def densify_and_clone(self, grads, grad_threshold, scene_extent):
+    def densify_and_clone(self, grads, grad_threshold, scene_extent, support_tau_densify=0.0):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
         selected_pts_mask = torch.logical_and(selected_pts_mask,
                                               torch.max(self.get_scaling, dim=1).values <= self.percent_dense*scene_extent)
+        if support_tau_densify > 0:
+            blocked_mask = torch.logical_and(selected_pts_mask, self.support_grow_ema < support_tau_densify)
+            self.densify_blocked_by_grow_support_count += int(blocked_mask.sum().item())
+            selected_pts_mask = torch.logical_and(selected_pts_mask, self.support_grow_ema >= support_tau_densify)
         
         new_xyz = self._xyz[selected_pts_mask]
         new_features_dc = self._features_dc[selected_pts_mask]
@@ -446,24 +566,59 @@ class GaussianModel:
         new_rotation = self._rotation[selected_pts_mask]
 
         new_tmp_radii = self.tmp_radii[selected_pts_mask]
+        new_support_grow_ema = self.support_grow_ema[selected_pts_mask]
+        new_support_prune_ema = self.support_prune_ema[selected_pts_mask]
+        new_support_hits = self.support_hits[selected_pts_mask]
+        new_age = torch.zeros((new_support_grow_ema.shape[0]), dtype=self.age.dtype, device="cuda")
 
-        self.densification_postfix(new_xyz, new_features_dc, new_features_rest, new_opacities, new_scaling, new_rotation, new_tmp_radii)
+        self.densification_postfix(
+            new_xyz,
+            new_features_dc,
+            new_features_rest,
+            new_opacities,
+            new_scaling,
+            new_rotation,
+            new_tmp_radii,
+            new_support_grow_ema,
+            new_support_prune_ema,
+            new_support_hits,
+            new_age,
+        )
 
-    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size, radii):
+    def densify_and_prune(
+        self,
+        max_grad,
+        min_opacity,
+        extent,
+        max_screen_size,
+        radii,
+        support_tau_densify=0.0,
+        support_tau_prune=0.0,
+        support_min_hits=8,
+        support_min_age=0,
+        support_opacity_cap=0.02,
+    ):
         grads = self.xyz_gradient_accum / self.denom
         grads[grads.isnan()] = 0.0
 
         self.tmp_radii = radii
-        self.densify_and_clone(grads, max_grad, extent)
-        self.densify_and_split(grads, max_grad, extent)
+        self.densify_and_clone(grads, max_grad, extent, support_tau_densify=support_tau_densify)
+        self.densify_and_split(grads, max_grad, extent, support_tau_densify=support_tau_densify)
 
         prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if support_tau_prune > 0:
+            low_support_mask = self.support_prune_ema < support_tau_prune
+            enough_hits_mask = self.support_hits >= support_min_hits
+            mature_mask = self.age >= support_min_age
+            low_opacity_mask = self.get_opacity.squeeze() < support_opacity_cap
+            support_prune_mask = low_support_mask & enough_hits_mask & mature_mask & low_opacity_mask
+            self.support_pruned_count += int(support_prune_mask.sum().item())
+            prune_mask = torch.logical_or(prune_mask, support_prune_mask)
         if max_screen_size:
             big_points_vs = self.max_radii2D > max_screen_size
             big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
             prune_mask = torch.logical_or(torch.logical_or(prune_mask, big_points_vs), big_points_ws)
         self.prune_points(prune_mask)
-        tmp_radii = self.tmp_radii
         self.tmp_radii = None
 
         torch.cuda.empty_cache()
@@ -471,3 +626,54 @@ class GaussianModel:
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor.grad[update_filter,:2], dim=-1, keepdim=True)
         self.denom[update_filter] += 1
+
+    def increment_age(self):
+        if self.age.numel() > 0:
+            self.age += 1
+
+    def update_support(self, visible_indices, grow_observations, prune_observations, beta):
+        if visible_indices.numel() == 0:
+            return
+
+        visible_indices = visible_indices.long().view(-1)
+        grow_observations = grow_observations.float().view(-1).clamp_(0.0, 1.0)
+        prune_observations = prune_observations.float().view(-1).clamp_(0.0, 1.0)
+        self.support_grow_ema[visible_indices] = beta * self.support_grow_ema[visible_indices] + (1.0 - beta) * grow_observations
+        self.support_prune_ema[visible_indices] = beta * self.support_prune_ema[visible_indices] + (1.0 - beta) * prune_observations
+        self.support_hits[visible_indices] += 1
+
+    def compute_support_stats(self, low_support_threshold):
+        total_gaussians = int(self.get_xyz.shape[0])
+        if total_gaussians == 0:
+            return {
+                "total_gaussians": 0,
+                "grow_support_mean": 0.0,
+                "grow_support_median": 0.0,
+                "prune_support_mean": 0.0,
+                "prune_support_median": 0.0,
+                "ratio_prune_support_below_0_10": 0.0,
+                "support_hits_mean": 0.0,
+                "support_pruned_count": int(self.support_pruned_count),
+                "densify_blocked_by_grow_support_count": int(self.densify_blocked_by_grow_support_count),
+                "mean_support_ema": 0.0,
+                "median_support_ema": 0.0,
+                "low_support_ratio": 0.0,
+            }
+
+        grow_support = self.support_grow_ema.detach().float()
+        prune_support = self.support_prune_ema.detach().float()
+        hits = self.support_hits.detach().float()
+        return {
+            "total_gaussians": total_gaussians,
+            "grow_support_mean": float(grow_support.mean().item()),
+            "grow_support_median": float(grow_support.median().item()),
+            "prune_support_mean": float(prune_support.mean().item()),
+            "prune_support_median": float(prune_support.median().item()),
+            "ratio_prune_support_below_0_10": float((prune_support < low_support_threshold).float().mean().item()),
+            "support_hits_mean": float(hits.mean().item()),
+            "support_pruned_count": int(self.support_pruned_count),
+            "densify_blocked_by_grow_support_count": int(self.densify_blocked_by_grow_support_count),
+            "mean_support_ema": float(prune_support.mean().item()),
+            "median_support_ema": float(prune_support.median().item()),
+            "low_support_ratio": float((prune_support < low_support_threshold).float().mean().item()),
+        }
