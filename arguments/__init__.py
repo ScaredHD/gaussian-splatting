@@ -104,6 +104,20 @@ class OptimizationParams(ParamGroup):
         self.depth_l1_weight_final = 0.01
         self.random_background = False
         self.optimizer_type = "default"
+        # -- online init (bootstrap + birth) --
+        self.online_init_mode = ""
+        self.online_aabb_path = ""
+        self.online_bootstrap_res = "16 16 16"
+        self.online_bootstrap_topk = 512
+        self.online_birth_iter = 500
+        self.online_birth_views = 8
+        self.online_birth_res = "64 64 64"
+        self.online_birth_topk = 2048
+        self.online_birth_valid_views_min = 5
+        self.online_birth_support_alpha_thr = 0.05
+        self.online_birth_support_ratio_min = 0.5
+        self.online_birth_repel_radius_mult = 1.0
+        self.online_init_opacity = 0.05
         super().__init__(parser, "Optimization Parameters")
 
 def get_combined_args(parser : ArgumentParser):

@@ -236,6 +236,79 @@ class GaussianModel:
         exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
         self._exposure = nn.Parameter(exposure.requires_grad_(True))
 
+    def create_from_bootstrap(self, bootstrap_params, cam_infos, spatial_lr_scale):
+        """Initialize the model from bootstrap seed tensors instead of a point cloud."""
+        self.spatial_lr_scale = spatial_lr_scale
+        n = bootstrap_params["xyz"].shape[0]
+        print("Number of points at initialisation (bootstrap): ", n)
+
+        self._xyz = nn.Parameter(bootstrap_params["xyz"].contiguous().requires_grad_(True))
+        self._features_dc = nn.Parameter(bootstrap_params["features_dc"].contiguous().requires_grad_(True))
+        self._features_rest = nn.Parameter(bootstrap_params["features_rest"].contiguous().requires_grad_(True))
+        self._scaling = nn.Parameter(bootstrap_params["scaling"].contiguous().requires_grad_(True))
+        self._rotation = nn.Parameter(bootstrap_params["rotation"].contiguous().requires_grad_(True))
+        self._opacity = nn.Parameter(bootstrap_params["opacity"].contiguous().requires_grad_(True))
+        self.max_radii2D = torch.zeros(n, device="cuda")
+        self.support_grow_ema = torch.zeros(n, dtype=torch.float32, device="cuda")
+        self.support_prune_ema = torch.zeros(n, dtype=torch.float32, device="cuda")
+        self.support_hits = torch.zeros(n, dtype=torch.int32, device="cuda")
+        self.age = torch.zeros(n, dtype=torch.int32, device="cuda")
+        self.support_pruned_count = 0
+        self.densify_blocked_by_grow_support_count = 0
+        self.exposure_mapping = {cam_info.image_name: idx for idx, cam_info in enumerate(cam_infos)}
+        self.pretrained_exposures = None
+        exposure = torch.eye(3, 4, device="cuda")[None].repeat(len(cam_infos), 1, 1)
+        self._exposure = nn.Parameter(exposure.requires_grad_(True))
+
+    def append_gaussians(self, new_params):
+        """Append new Gaussians. Only initializes new rows; does NOT reset old densify stats."""
+        d = {
+            "xyz": new_params["xyz"],
+            "f_dc": new_params["features_dc"],
+            "f_rest": new_params["features_rest"],
+            "opacity": new_params["opacity"],
+            "scaling": new_params["scaling"],
+            "rotation": new_params["rotation"],
+        }
+        optimizable_tensors = self.cat_tensors_to_optimizer(d)
+        self._xyz = optimizable_tensors["xyz"]
+        self._features_dc = optimizable_tensors["f_dc"]
+        self._features_rest = optimizable_tensors["f_rest"]
+        self._opacity = optimizable_tensors["opacity"]
+        self._scaling = optimizable_tensors["scaling"]
+        self._rotation = optimizable_tensors["rotation"]
+
+        n_new = new_params["xyz"].shape[0]
+        self.xyz_gradient_accum = torch.cat([
+            self.xyz_gradient_accum,
+            torch.zeros((n_new, 1), device="cuda"),
+        ], dim=0)
+        self.denom = torch.cat([
+            self.denom,
+            torch.zeros((n_new, 1), device="cuda"),
+        ], dim=0)
+        self.max_radii2D = torch.cat([
+            self.max_radii2D,
+            torch.zeros(n_new, device="cuda"),
+        ], dim=0)
+        self.support_grow_ema = torch.cat([
+            self.support_grow_ema,
+            torch.zeros(n_new, dtype=torch.float32, device="cuda"),
+        ], dim=0)
+        self.support_prune_ema = torch.cat([
+            self.support_prune_ema,
+            torch.zeros(n_new, dtype=torch.float32, device="cuda"),
+        ], dim=0)
+        self.support_hits = torch.cat([
+            self.support_hits,
+            torch.zeros(n_new, dtype=torch.int32, device="cuda"),
+        ], dim=0)
+        self.age = torch.cat([
+            self.age,
+            torch.zeros(n_new, dtype=torch.int32, device="cuda"),
+        ], dim=0)
+
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")

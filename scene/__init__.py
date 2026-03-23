@@ -22,7 +22,7 @@ class Scene:
 
     gaussians : GaussianModel
 
-    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0]):
+    def __init__(self, args : ModelParams, gaussians : GaussianModel, load_iteration=None, shuffle=True, resolution_scales=[1.0], online_init_mode=""):
         """b
         :param path: Path to colmap scene main folder.
         """
@@ -79,6 +79,12 @@ class Scene:
                                                            "point_cloud",
                                                            "iteration_" + str(self.loaded_iter),
                                                            "point_cloud.ply"), args.train_test_exp)
+        elif online_init_mode:
+            # Skip create_from_pcd; caller will use create_from_bootstrap
+            print(f"[online_init] mode={online_init_mode}: skipping create_from_pcd, "
+                  f"waiting for bootstrap initialization.")
+            # Store scene_info for caller to access cam_infos
+            self._scene_info = scene_info
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, scene_info.train_cameras, self.cameras_extent)
 

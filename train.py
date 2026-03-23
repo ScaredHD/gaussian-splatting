@@ -21,6 +21,7 @@ from tqdm import tqdm
 
 from arguments import ModelParams, OptimizationParams, PipelineParams
 from gaussian_renderer import network_gui, render
+from online_init import load_aabb, run_bootstrap, run_birth
 from scene import GaussianModel, Scene
 from utils.general_utils import get_expon_lr_func, safe_state
 from utils.image_utils import psnr
@@ -266,7 +267,31 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
-    scene = Scene(dataset, gaussians)
+    online_mode = (opt.online_init_mode or "").strip()
+    valid_online_modes = {"", "bootstrap_only", "bootstrap_birth"}
+    if online_mode not in valid_online_modes:
+        valid_text = "'' (disabled), 'bootstrap_only', 'bootstrap_birth'"
+        sys.exit(f"[online_init] invalid --online_init_mode '{online_mode}'. "
+                 f"Valid values are: {valid_text}.")
+    scene = Scene(dataset, gaussians, online_init_mode=online_mode)
+
+    # ── online bootstrap initialization ──────────────────────────────────
+    if online_mode in ("bootstrap_only", "bootstrap_birth"):
+        aabb_path = opt.online_aabb_path
+        if not aabb_path:
+            sys.exit("[online_init] --online_aabb_path is required when online_init_mode is set.")
+        if not os.path.isfile(aabb_path):
+            sys.exit(f"[online_init] AABB json not found: {aabb_path}")
+        aabb = load_aabb(aabb_path)
+        print(f"[online_init] loaded AABB from {aabb_path}: "
+              f"min={aabb['min'].tolist()}, max={aabb['max'].tolist()}")
+        train_cams = scene.getTrainCameras()
+        bootstrap_params = run_bootstrap(aabb, train_cams, opt, dataset.sh_degree)
+        if bootstrap_params is None:
+            sys.exit("[online_init] bootstrap produced no seeds. Aborting.")
+        cam_infos = scene._scene_info.train_cameras + scene._scene_info.test_cameras
+        gaussians.create_from_bootstrap(bootstrap_params, cam_infos, scene.cameras_extent)
+
     gaussians.training_setup(opt)
     if checkpoint:
         model_params, first_iter = torch.load(checkpoint)
@@ -417,6 +442,23 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     gaussians,
                     snapshot_dir=os.path.join(dataset.model_path, "point_cloud", "iteration_{}".format(iteration)),
                 )
+
+            # ── one-shot birth ────────────────────────────────────────────
+            if (online_mode == "bootstrap_birth"
+                    and iteration == opt.online_birth_iter):
+                print(f"\n[ITER {iteration}] Running one-shot birth...")
+                birth_params = run_birth(
+                    aabb, scene.getTrainCameras(), gaussians,
+                    render, pipe, background, SPARSE_ADAM_AVAILABLE, opt, dataset.sh_degree,
+                )
+                if birth_params is not None:
+                    n_before = gaussians.get_xyz.shape[0]
+                    gaussians.append_gaussians(birth_params)
+                    n_after = gaussians.get_xyz.shape[0]
+                    print(f"[birth] appended {n_after - n_before} new Gaussians "
+                          f"({n_before} -> {n_after})")
+                else:
+                    print("[birth] no candidates survived. Continuing without new points.")
 
             if iteration < opt.densify_until_iter:
                 gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
