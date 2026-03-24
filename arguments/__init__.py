@@ -92,9 +92,10 @@ class OptimizationParams(ParamGroup):
         self.boundary_alpha_weight = 1.0
         self.alpha_bg_threshold = 0.05
         self.alpha_fg_threshold = 0.95
+        self.enable_support = False
         self.support_beta = 0.9
-        self.support_tau_densify = 0.25
-        self.support_tau_prune = 0.10
+        self.support_tau_densify = 0.0
+        self.support_tau_prune = 0.0
         self.densification_interval = 100
         self.opacity_reset_interval = 3000
         self.densify_from_iter = 500

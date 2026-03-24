@@ -202,15 +202,19 @@ def compute_visible_support_observations(viewpoint, gaussians, gt_alpha, visibil
     return updated_indices, grow_observations, prune_observations
 
 
-def persist_support_stats(model_path, iteration, gaussians, snapshot_dir=None):
+def persist_support_stats(model_path, iteration, gaussians, snapshot_dir=None, support_enabled=True):
     stats = {"iteration": int(iteration)}
     stats.update(gaussians.compute_support_stats(SUPPORT_DIAGNOSTIC_THRESHOLD))
 
+    support_mode = "dual_support_v1" if support_enabled else "disabled"
+    grow_observation = "a_in" if support_enabled else "disabled"
+    prune_observation = "a_in_times_a_ring" if support_enabled else "disabled"
+
     stats_path = os.path.join(model_path, "support_stats.json")
     payload = {
-        "support_mode": "dual_support_v1",
-        "grow_observation": "a_in",
-        "prune_observation": "a_in_times_a_ring",
+        "support_mode": support_mode,
+        "grow_observation": grow_observation,
+        "prune_observation": prune_observation,
         "diagnostic_threshold": SUPPORT_DIAGNOSTIC_THRESHOLD,
         "latest": stats,
         "snapshots": [stats],
@@ -223,9 +227,9 @@ def persist_support_stats(model_path, iteration, gaussians, snapshot_dir=None):
         snapshots.sort(key=lambda item: item.get("iteration", -1))
         payload["snapshots"] = snapshots
         payload["latest"] = stats
-        payload["support_mode"] = "dual_support_v1"
-        payload["grow_observation"] = "a_in"
-        payload["prune_observation"] = "a_in_times_a_ring"
+        payload["support_mode"] = support_mode
+        payload["grow_observation"] = grow_observation
+        payload["prune_observation"] = prune_observation
         payload["diagnostic_threshold"] = SUPPORT_DIAGNOSTIC_THRESHOLD
 
     with open(stats_path, "w", encoding="utf-8") as f:
@@ -335,6 +339,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
     first_iter = 0
     tb_writer = prepare_output_and_logger(dataset)
     gaussians = GaussianModel(dataset.sh_degree, opt.optimizer_type)
+    support_enabled = bool(getattr(opt, "enable_support", False))
     online_mode = (opt.online_init_mode or "").strip()
     valid_online_modes = {"", "bootstrap_only", "bootstrap_birth"}
     if online_mode not in valid_online_modes:
@@ -464,36 +469,37 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         iter_end.record()
 
         with torch.no_grad():
-            support_indices, grow_support_observations, prune_support_observations = compute_visible_support_observations(
-                viewpoint_cam,
-                gaussians,
-                gt_alpha,
-                visibility_filter,
-            )
-            gaussians.update_support(
-                support_indices,
-                grow_support_observations,
-                prune_support_observations,
-                opt.support_beta,
-            )
+            if support_enabled:
+                support_indices, grow_support_observations, prune_support_observations = compute_visible_support_observations(
+                    viewpoint_cam,
+                    gaussians,
+                    gt_alpha,
+                    visibility_filter,
+                )
+                gaussians.update_support(
+                    support_indices,
+                    grow_support_observations,
+                    prune_support_observations,
+                    opt.support_beta,
+                )
 
             ema_total_loss_for_log = 0.4 * loss.item() + 0.6 * ema_total_loss_for_log
             ema_rgb_loss_for_log = 0.4 * rgb_loss.item() + 0.6 * ema_rgb_loss_for_log
             ema_alpha_loss_for_log = 0.4 * alpha_loss.item() + 0.6 * ema_alpha_loss_for_log
             ema_depth_loss_for_log = 0.4 * ll1depth_value + 0.6 * ema_depth_loss_for_log
-            support_stats = gaussians.compute_support_stats(SUPPORT_DIAGNOSTIC_THRESHOLD)
+            support_stats = gaussians.compute_support_stats(SUPPORT_DIAGNOSTIC_THRESHOLD) if support_enabled else None
 
             if iteration % 10 == 0:
-                progress_bar.set_postfix(
-                    {
-                        "Loss": f"{ema_total_loss_for_log:.7f}",
-                        "RGB": f"{ema_rgb_loss_for_log:.7f}",
-                        "Alpha": f"{ema_alpha_loss_for_log:.7f}",
-                        "Depth": f"{ema_depth_loss_for_log:.7f}",
-                        "Grow": f"{support_stats['grow_support_mean']:.4f}",
-                        "Prune": f"{support_stats['prune_support_mean']:.4f}",
-                    }
-                )
+                postfix = {
+                    "Loss": f"{ema_total_loss_for_log:.7f}",
+                    "RGB": f"{ema_rgb_loss_for_log:.7f}",
+                    "Alpha": f"{ema_alpha_loss_for_log:.7f}",
+                    "Depth": f"{ema_depth_loss_for_log:.7f}",
+                }
+                if support_enabled and support_stats is not None:
+                    postfix["Grow"] = f"{support_stats['grow_support_mean']:.4f}"
+                    postfix["Prune"] = f"{support_stats['prune_support_mean']:.4f}"
+                progress_bar.set_postfix(postfix)
                 progress_bar.update(10)
             if iteration == opt.iterations:
                 progress_bar.close()
@@ -540,7 +546,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 opt,
             )
             if iteration in testing_iterations or iteration == opt.iterations:
-                persist_support_stats(dataset.model_path, iteration, gaussians)
+                persist_support_stats(dataset.model_path, iteration, gaussians, support_enabled=support_enabled)
             if iteration in saving_iterations:
                 print("\n[ITER {}] Saving Gaussians".format(iteration))
                 scene.save(iteration)
@@ -549,6 +555,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     iteration,
                     gaussians,
                     snapshot_dir=os.path.join(dataset.model_path, "point_cloud", "iteration_{}".format(iteration)),
+                    support_enabled=support_enabled,
                 )
 
             aligned_visibility_filter, aligned_radii = align_render_buffers_to_gaussians(
@@ -572,8 +579,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         scene.cameras_extent,
                         size_threshold,
                         aligned_radii,
-                        support_tau_densify=opt.support_tau_densify,
-                        support_tau_prune=opt.support_tau_prune,
+                        support_tau_densify=(opt.support_tau_densify if support_enabled else 0.0),
+                        support_tau_prune=(opt.support_tau_prune if support_enabled else 0.0),
                         support_min_hits=SUPPORT_PRUNE_MIN_HITS,
                         support_min_age=2 * opt.densification_interval,
                         support_opacity_cap=SUPPORT_PRUNE_OPACITY_CAP,
@@ -656,19 +663,20 @@ def training_report(tb_writer, iteration, rgb_loss, alpha_loss, total_loss, elap
 
     if tb_writer:
         tb_writer.add_histogram("scene/opacity_histogram", scene.gaussians.get_opacity, iteration)
-        support_stats = scene.gaussians.compute_support_stats(SUPPORT_DIAGNOSTIC_THRESHOLD)
-        tb_writer.add_scalar("scene/grow_support_mean", support_stats["grow_support_mean"], iteration)
-        tb_writer.add_scalar("scene/grow_support_median", support_stats["grow_support_median"], iteration)
-        tb_writer.add_scalar("scene/prune_support_mean", support_stats["prune_support_mean"], iteration)
-        tb_writer.add_scalar("scene/prune_support_median", support_stats["prune_support_median"], iteration)
-        tb_writer.add_scalar("scene/ratio_prune_support_below_0_10", support_stats["ratio_prune_support_below_0_10"], iteration)
-        tb_writer.add_scalar("scene/support_hits_mean", support_stats["support_hits_mean"], iteration)
-        tb_writer.add_scalar("scene/support_pruned_count", support_stats["support_pruned_count"], iteration)
-        tb_writer.add_scalar(
-            "scene/densify_blocked_by_grow_support_count",
-            support_stats["densify_blocked_by_grow_support_count"],
-            iteration,
-        )
+        if getattr(opt, "enable_support", False):
+            support_stats = scene.gaussians.compute_support_stats(SUPPORT_DIAGNOSTIC_THRESHOLD)
+            tb_writer.add_scalar("scene/grow_support_mean", support_stats["grow_support_mean"], iteration)
+            tb_writer.add_scalar("scene/grow_support_median", support_stats["grow_support_median"], iteration)
+            tb_writer.add_scalar("scene/prune_support_mean", support_stats["prune_support_mean"], iteration)
+            tb_writer.add_scalar("scene/prune_support_median", support_stats["prune_support_median"], iteration)
+            tb_writer.add_scalar("scene/ratio_prune_support_below_0_10", support_stats["ratio_prune_support_below_0_10"], iteration)
+            tb_writer.add_scalar("scene/support_hits_mean", support_stats["support_hits_mean"], iteration)
+            tb_writer.add_scalar("scene/support_pruned_count", support_stats["support_pruned_count"], iteration)
+            tb_writer.add_scalar(
+                "scene/densify_blocked_by_grow_support_count",
+                support_stats["densify_blocked_by_grow_support_count"],
+                iteration,
+            )
         tb_writer.add_scalar("total_points", scene.gaussians.get_xyz.shape[0], iteration)
     torch.cuda.empty_cache()
 
