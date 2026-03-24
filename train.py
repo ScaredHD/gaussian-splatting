@@ -237,6 +237,74 @@ def persist_support_stats(model_path, iteration, gaussians, snapshot_dir=None):
             json.dump(stats, f, indent=2)
 
 
+def parse_positive_int_list(raw_value, arg_name):
+    text = str(raw_value or "").strip()
+    if not text:
+        return []
+
+    values = []
+    for token in text.split():
+        try:
+            parsed = int(token)
+        except ValueError:
+            raise ValueError(f"{arg_name} contains non-integer token '{token}'.")
+        if parsed <= 0:
+            raise ValueError(f"{arg_name} expects positive integers, got {parsed}.")
+        values.append(parsed)
+    return values
+
+
+def resolve_birth_plan(opt):
+    birth_iters = parse_positive_int_list(getattr(opt, "online_birth_iters", ""), "--online_birth_iters")
+    if not birth_iters:
+        birth_iters = [int(opt.online_birth_iter)]
+    birth_iters = sorted(set(birth_iters))
+
+    topk_values = parse_positive_int_list(
+        getattr(opt, "online_birth_topk_schedule", ""),
+        "--online_birth_topk_schedule",
+    )
+    if not topk_values:
+        topk_values = [int(opt.online_birth_topk)] * len(birth_iters)
+    elif len(topk_values) == 1 and len(birth_iters) > 1:
+        topk_values = topk_values * len(birth_iters)
+    elif len(topk_values) != len(birth_iters):
+        raise ValueError(
+            "--online_birth_topk_schedule length must be 1 or match "
+            f"--online_birth_iters length ({len(birth_iters)})."
+        )
+
+    total_passes = len(birth_iters)
+    plan = {}
+    for idx, (birth_iter, topk_value) in enumerate(zip(birth_iters, topk_values), start=1):
+        plan[int(birth_iter)] = {
+            "topk": int(topk_value),
+            "pass_index": idx,
+            "total_passes": total_passes,
+        }
+    return plan
+
+
+def align_render_buffers_to_gaussians(visibility_filter, radii, total_points):
+    """Align per-render tensors to current Gaussian count after online point appends."""
+    if visibility_filter.dtype == torch.bool:
+        visible_indices = visibility_filter.nonzero(as_tuple=True)[0]
+    else:
+        visible_indices = visibility_filter.long().view(-1)
+
+    visible_indices = visible_indices[visible_indices >= 0]
+    visible_indices = visible_indices[visible_indices < total_points]
+
+    if radii.shape[0] < total_points:
+        pad = torch.zeros((total_points - radii.shape[0]), dtype=radii.dtype, device=radii.device)
+        radii = torch.cat((radii, pad), dim=0)
+    elif radii.shape[0] > total_points:
+        radii = radii[:total_points]
+
+    visible_indices = visible_indices[visible_indices < radii.shape[0]]
+    return visible_indices, radii
+
+
 
 def prepare_output_and_logger(args):
     if not args.model_path:
@@ -291,6 +359,19 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             sys.exit("[online_init] bootstrap produced no seeds. Aborting.")
         cam_infos = scene._scene_info.train_cameras + scene._scene_info.test_cameras
         gaussians.create_from_bootstrap(bootstrap_params, cam_infos, scene.cameras_extent)
+
+    birth_plan = {}
+    if online_mode == "bootstrap_birth":
+        try:
+            birth_plan = resolve_birth_plan(opt)
+        except ValueError as exc:
+            sys.exit(f"[online_init] {exc}")
+
+        birth_items = []
+        for birth_iter in sorted(birth_plan.keys()):
+            cfg = birth_plan[birth_iter]
+            birth_items.append(f"iter {birth_iter}: topk={cfg['topk']}")
+        print(f"[online_init] birth schedule -> {', '.join(birth_items)}")
 
     gaussians.training_setup(opt)
     if checkpoint:
@@ -417,6 +498,33 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
+            if online_mode == "bootstrap_birth" and iteration in birth_plan:
+                birth_cfg = birth_plan[iteration]
+                birth_tag = f"pass {birth_cfg['pass_index']}/{birth_cfg['total_passes']}"
+                birth_topk = int(birth_cfg["topk"])
+                print(f"\n[ITER {iteration}] Running birth {birth_tag} (topk={birth_topk})...")
+                birth_params = run_birth(
+                    aabb,
+                    scene.getTrainCameras(),
+                    gaussians,
+                    render,
+                    pipe,
+                    background,
+                    SPARSE_ADAM_AVAILABLE,
+                    opt,
+                    dataset.sh_degree,
+                    topk_override=birth_topk,
+                    birth_tag=birth_tag,
+                )
+                if birth_params is not None:
+                    n_before = gaussians.get_xyz.shape[0]
+                    gaussians.append_gaussians(birth_params)
+                    n_after = gaussians.get_xyz.shape[0]
+                    print(f"[birth] {birth_tag} appended {n_after - n_before} new Gaussians "
+                          f"({n_before} -> {n_after})")
+                else:
+                    print(f"[birth] {birth_tag} no candidates survived. Continuing without new points.")
+
             training_report(
                 tb_writer,
                 iteration,
@@ -443,26 +551,18 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                     snapshot_dir=os.path.join(dataset.model_path, "point_cloud", "iteration_{}".format(iteration)),
                 )
 
-            # ── one-shot birth ────────────────────────────────────────────
-            if (online_mode == "bootstrap_birth"
-                    and iteration == opt.online_birth_iter):
-                print(f"\n[ITER {iteration}] Running one-shot birth...")
-                birth_params = run_birth(
-                    aabb, scene.getTrainCameras(), gaussians,
-                    render, pipe, background, SPARSE_ADAM_AVAILABLE, opt, dataset.sh_degree,
-                )
-                if birth_params is not None:
-                    n_before = gaussians.get_xyz.shape[0]
-                    gaussians.append_gaussians(birth_params)
-                    n_after = gaussians.get_xyz.shape[0]
-                    print(f"[birth] appended {n_after - n_before} new Gaussians "
-                          f"({n_before} -> {n_after})")
-                else:
-                    print("[birth] no candidates survived. Continuing without new points.")
+            aligned_visibility_filter, aligned_radii = align_render_buffers_to_gaussians(
+                visibility_filter,
+                radii,
+                gaussians.get_xyz.shape[0],
+            )
 
             if iteration < opt.densify_until_iter:
-                gaussians.max_radii2D[visibility_filter] = torch.max(gaussians.max_radii2D[visibility_filter], radii[visibility_filter])
-                gaussians.add_densification_stats(viewspace_point_tensor, visibility_filter)
+                gaussians.max_radii2D[aligned_visibility_filter] = torch.max(
+                    gaussians.max_radii2D[aligned_visibility_filter],
+                    aligned_radii[aligned_visibility_filter],
+                )
+                gaussians.add_densification_stats(viewspace_point_tensor, aligned_visibility_filter)
 
                 if iteration > opt.densify_from_iter and iteration % opt.densification_interval == 0:
                     size_threshold = 20 if iteration > opt.opacity_reset_interval else None
@@ -471,7 +571,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         0.005,
                         scene.cameras_extent,
                         size_threshold,
-                        radii,
+                        aligned_radii,
                         support_tau_densify=opt.support_tau_densify,
                         support_tau_prune=opt.support_tau_prune,
                         support_min_hits=SUPPORT_PRUNE_MIN_HITS,
@@ -486,8 +586,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 gaussians.exposure_optimizer.step()
                 gaussians.exposure_optimizer.zero_grad(set_to_none=True)
                 if use_sparse_adam:
-                    visible = radii > 0
-                    gaussians.optimizer.step(visible, radii.shape[0])
+                    visible = aligned_radii > 0
+                    gaussians.optimizer.step(visible, aligned_radii.shape[0])
                     gaussians.optimizer.zero_grad(set_to_none=True)
                 else:
                     gaussians.optimizer.step()

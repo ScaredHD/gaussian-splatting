@@ -1,5 +1,5 @@
 """
-Online Gaussian initialization: bootstrap + one-shot birth.
+Online Gaussian initialization: bootstrap + configurable birth passes.
 
 Implements the v1 spec from:
   docs/3_22/2026-03-22_稀疏初始化与在线Gaussian补点方法设计.md
@@ -246,15 +246,27 @@ def run_bootstrap(aabb, train_cameras, opt, sh_degree):
     return _init_gaussian_params(sel_centres, sel_rgb, voxel_sizes, init_opacity, sh_degree)
 
 
-# ── ONE-SHOT BIRTH ────────────────────────────────────────────────────────────
+# ── BIRTH PASS ────────────────────────────────────────────────────────────────
 
-def run_birth(aabb, train_cameras, gaussians, render_func, pipe, background, separate_sh, opt, sh_degree):
-    """One-shot birth at a fixed iteration.
+def run_birth(
+    aabb,
+    train_cameras,
+    gaussians,
+    render_func,
+    pipe,
+    background,
+    separate_sh,
+    opt,
+    sh_degree,
+    topk_override=None,
+    birth_tag="",
+):
+    """Run one birth pass.
 
     Returns a param dict on CUDA, or None if no candidate survives.
     """
     res = _parse_res(opt.online_birth_res)
-    topk = opt.online_birth_topk
+    topk = int(opt.online_birth_topk if topk_override is None else topk_override)
     n_views = opt.online_birth_views
     min_valid = opt.online_birth_valid_views_min
     alpha_thr = opt.online_birth_support_alpha_thr
@@ -268,7 +280,8 @@ def run_birth(aabb, train_cameras, gaussians, render_func, pipe, background, sep
     view_indices = _evenly_spaced_indices(total_views, n_views)
     selected_cams = [sorted_cams[i] for i in view_indices]
 
-    print(f"[birth] using {len(selected_cams)} views (sorted indices {view_indices}) "
+    tag_prefix = f"[{birth_tag}] " if birth_tag else ""
+    print(f"[birth] {tag_prefix}using {len(selected_cams)} views (sorted indices {view_indices}) "
           f"from {total_views} train views")
 
     centres, voxel_sizes = _build_voxel_centers(aabb, res)
@@ -325,7 +338,7 @@ def run_birth(aabb, train_cameras, gaussians, render_func, pipe, background, sep
 
     gate_mask = valid_mask & (support_ratio >= ratio_min) & (q > 0.0)
 
-    print(f"[birth] valid voxels: {int(valid_mask.sum())}, "
+    print(f"[birth] {tag_prefix}valid voxels: {int(valid_mask.sum())}, "
           f"gate pass (before repulsion): {int(gate_mask.sum())}")
 
     if not gate_mask.any():
@@ -353,7 +366,7 @@ def run_birth(aabb, train_cameras, gaussians, render_func, pipe, background, sep
         rejected = int((~keep).sum().item())
         gate_mask[cand_idx] = keep
 
-        print(f"[birth] repulsion rejected {rejected} candidates (radius {repel_dist:.4f})")
+        print(f"[birth] {tag_prefix}repulsion rejected {rejected} candidates (radius {repel_dist:.4f})")
 
     if not gate_mask.any():
         print("[birth] no candidate after repulsion. Returning None.")
@@ -382,7 +395,7 @@ def run_birth(aabb, train_cameras, gaussians, render_func, pipe, background, sep
     sel_rgb = sel_rgb_sum / (sel_weights.unsqueeze(-1) + EPS)
     sel_rgb = sel_rgb.clamp(0.0, 1.0)
 
-    print(f"[birth] selected {k} new Gaussians (from {int(gate_mask.sum())} candidates, "
+    print(f"[birth] {tag_prefix}selected {k} new Gaussians (from {int(gate_mask.sum())} candidates, "
           f"grid {res[0]}x{res[1]}x{res[2]})")
 
     return _init_gaussian_params(sel_centres, sel_rgb, voxel_sizes, init_opacity, sh_degree)

@@ -110,9 +110,11 @@ class OptimizationParams(ParamGroup):
         self.online_bootstrap_res = "16 16 16"
         self.online_bootstrap_topk = 512
         self.online_birth_iter = 500
+        self.online_birth_iters = ""
         self.online_birth_views = 8
         self.online_birth_res = "64 64 64"
         self.online_birth_topk = 2048
+        self.online_birth_topk_schedule = ""
         self.online_birth_valid_views_min = 5
         self.online_birth_support_alpha_thr = 0.05
         self.online_birth_support_ratio_min = 0.5
