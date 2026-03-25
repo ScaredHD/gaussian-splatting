@@ -270,8 +270,11 @@ def run_birth(
     n_views = opt.online_birth_views
     min_valid = opt.online_birth_valid_views_min
     alpha_thr = opt.online_birth_support_alpha_thr
+    bg_alpha_thr = float(getattr(opt, "online_birth_bg_alpha_thr", alpha_thr))
+    neg_weight = float(getattr(opt, "online_birth_neg_weight", 0.0))
     ratio_min = opt.online_birth_support_ratio_min
     repel_mult = opt.online_birth_repel_radius_mult
+    total_cap = int(getattr(opt, "online_birth_total_cap", 0))
     init_opacity = opt.online_init_opacity
 
     # deterministic view sampling: sort by image_name then pick evenly spaced views
@@ -283,6 +286,16 @@ def run_birth(
     tag_prefix = f"[{birth_tag}] " if birth_tag else ""
     print(f"[birth] {tag_prefix}using {len(selected_cams)} views (sorted indices {view_indices}) "
           f"from {total_views} train views")
+    print(f"[birth] {tag_prefix}score params: fg_thr={alpha_thr:.4f}, bg_thr={bg_alpha_thr:.4f}, neg_weight={neg_weight:.4f}")
+    if total_cap > 0:
+        n_current = int(gaussians.get_xyz.shape[0])
+        remaining = max(0, total_cap - n_current)
+        if remaining <= 0:
+            print(f"[birth] {tag_prefix}skip because total cap reached: current={n_current}, cap={total_cap}")
+            return None
+        if topk > remaining:
+            print(f"[birth] {tag_prefix}cap clipped topk {topk} -> {remaining} (current={n_current}, cap={total_cap})")
+            topk = remaining
 
     centres, voxel_sizes = _build_voxel_centers(aabb, res)
     N = centres.shape[0]
@@ -291,7 +304,8 @@ def run_birth(
 
     # per-voxel accumulators
     valid_count = torch.zeros(N, dtype=torch.int32, device="cuda")
-    q_sum = torch.zeros(N, dtype=torch.float32, device="cuda")        # sum m_t * r_t
+    pos_sum = torch.zeros(N, dtype=torch.float32, device="cuda")      # sum m_t * r_t^+
+    neg_sum = torch.zeros(N, dtype=torch.float32, device="cuda")      # sum b_t * r_t^-
     support_count = torch.zeros(N, dtype=torch.int32, device="cuda")  # sum m_t
 
     # colour accumulators
@@ -314,11 +328,14 @@ def run_birth(
         a_pred = _sample_image(pred_alpha, grid).squeeze(-1).clamp(0.0, 1.0)
         rgb_vals = _sample_image(gt_rgb, grid).clamp(0.0, 1.0)              # (N,3)
 
-        r_t = (a_gt - a_pred).clamp(min=0.0)                                # (N,)
+        r_pos = (a_gt - a_pred).clamp(min=0.0)                               # (N,)
+        r_neg = (a_pred - a_gt).clamp(min=0.0)                               # (N,)
         m_t = (inside & (a_gt > alpha_thr)).float()                          # (N,)
+        b_t = (inside & (a_gt < bg_alpha_thr)).float()                       # (N,)
 
         valid_count[inside] += 1
-        q_sum[inside] += (m_t * r_t)[inside]
+        pos_sum[inside] += (m_t * r_pos)[inside]
+        neg_sum[inside] += (b_t * r_neg)[inside]
         support_count += m_t.int()
 
         sup_mask = inside & (m_t > 0.5)
@@ -328,7 +345,7 @@ def run_birth(
             colour_rgb_sum[sup_mask] += w.unsqueeze(-1) * rgb_vals[sup_mask]
 
     # ── gating ────────────────────────────────────────────────────────────────
-    q = q_sum.clone()
+    q = pos_sum - (neg_weight * neg_sum)
     valid_mask = valid_count >= min_valid
     q[valid_mask] /= valid_count[valid_mask].float()
     q[~valid_mask] = 0.0

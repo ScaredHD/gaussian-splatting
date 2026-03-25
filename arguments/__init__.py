@@ -118,8 +118,11 @@ class OptimizationParams(ParamGroup):
         self.online_birth_topk_schedule = ""
         self.online_birth_valid_views_min = 5
         self.online_birth_support_alpha_thr = 0.05
+        self.online_birth_bg_alpha_thr = 0.05
         self.online_birth_support_ratio_min = 0.5
+        self.online_birth_neg_weight = 0.0
         self.online_birth_repel_radius_mult = 1.0
+        self.online_birth_total_cap = 0
         self.online_init_opacity = 0.05
         super().__init__(parser, "Optimization Parameters")
 
