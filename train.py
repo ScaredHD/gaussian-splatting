@@ -450,7 +450,8 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             alpha_fg_threshold=opt.alpha_fg_threshold,
         )
 
-        rgb_loss, rgb_l1, _ = compute_rgb_loss(image, gt_premul, opt.lambda_dssim)
+        gt_for_rgb_loss = gt_rgb if opt.no_premult_alpha else gt_premul
+        rgb_loss, rgb_l1, _ = compute_rgb_loss(image, gt_for_rgb_loss, opt.lambda_dssim)
         alpha_loss = compute_weighted_alpha_l1(pred_alpha, gt_alpha, boundary_mask, opt.boundary_alpha_weight)
         loss = rgb_loss + opt.lambda_alpha * alpha_loss
 
